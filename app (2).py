@@ -103,6 +103,22 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
+st.markdown("""
+<div style="background:#fff; border-left:4px solid #e31e24; border-radius:8px;
+            padding:10px 20px; margin-bottom:18px; box-shadow:0 1px 6px rgba(0,0,0,.07);
+            display:flex; align-items:center; gap:32px; flex-wrap:wrap;">
+    <span style="font-size:.82rem; color:#555;">
+        <b style="color:#1a1a2e;">ℹ️ En cas de besoin, contacter :</b>
+        &nbsp;&nbsp;
+        <b>JEAN MATA</b>
+        &nbsp;|&nbsp;
+        📞 <a href="tel:+33987238238" style="color:#e31e24;text-decoration:none;">+33 987 238 238</a>
+        &nbsp;|&nbsp;
+        ✉️ <a href="mailto:jean@gmail.com" style="color:#e31e24;text-decoration:none;">jean@gmail.com</a>
+    </span>
+</div>
+""", unsafe_allow_html=True)
+
 # ─────────────────────────────────────────────
 # SESSION STATE
 # ─────────────────────────────────────────────
@@ -189,6 +205,12 @@ def interpolate_rate(maturity_days, curve_maturities_days, curve_rates):
             return float(y0 + (y1 - y0) * (maturity_days - x0) / (x1 - x0))
     return float(rats[-1])
 
+def _days_to_years_label(d: datetime.date, eval_date: datetime.date) -> str:
+    """Retourne 'DD/MM/YYYY (X.XX ans)' pour affichage des échéances."""
+    days  = (d - eval_date).days
+    years = days / 365.25
+    return f"{d.strftime('%d/%m/%Y')} ({years:.2f} ans)"
+
 # ─────────────────────────────────────────────
 # HELPER: PARSE BAM CSV OFFICIEL
 # Format: "Date d'échéance";Transaction;"Taux moyen pondéré";"Date de la valeur"
@@ -233,7 +255,7 @@ def parse_bam_csv(file_content: bytes, eval_date: datetime.date):
             days = (d - eval_date).days
             if days <= 0:
                 continue
-            label = f"{d.strftime('%d/%m/%Y')} ({days}j)"
+            label = _days_to_years_label(d, eval_date)
             mats.append(days)
             rats.append(rate)
             labels.append(label)
@@ -249,66 +271,135 @@ def parse_bam_csv(file_content: bytes, eval_date: datetime.date):
 
 # ─────────────────────────────────────────────
 # HELPER: FETCH BAM AUTOMATIQUE
-# URL basée sur le code VBA officiel (bons-de-tresor avec ?date=)
+# Essaie plusieurs URLs officielles BAM (HTML + CSV direct)
 # ─────────────────────────────────────────────
-def fetch_bam_auto(eval_date: datetime.date):
-    date_str = eval_date.strftime("%d/%m/%Y")
-    # Exactement l'URL du VBA: bons-de-tresor (pas bons-du-tresor) + ?date=
-    url = (
-        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        "Marche-des-bons-de-tresor/Marche-secondaire/"
-        f"Taux-de-reference-des-bons-du-tresor?date={date_str}"
-    )
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-        "Referer":         "https://www.bkam.ma/",
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-
-    soup   = BeautifulSoup(resp.text, "html.parser")
+def _parse_bam_html_table(html_text: str, eval_date: datetime.date):
+    """Parse une page HTML BAM et extrait la courbe de taux."""
+    soup   = BeautifulSoup(html_text, "html.parser")
     tables = soup.find_all("table")
     if not tables:
-        raise ValueError("Aucune table trouvée sur la page BAM.")
+        raise ValueError("Aucune table trouvée dans la réponse HTML.")
 
-    # WebTables = "1" in VBA → first table
-    target = tables[0]
-    rows   = target.find_all("tr")
     mats, rats, labels = [], [], []
     date_valeur = None
+    last_err = None
 
-    for row in rows:
-        cols = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-        if len(cols) < 3:
-            continue
-        try:
-            d      = datetime.datetime.strptime(cols[0].strip(), "%d/%m/%Y").date()
-            taux_r = cols[2].strip().replace("%", "").replace(",", ".").replace(" ", "")
-            rate   = float(taux_r) / 100
-            days   = (d - eval_date).days
-            if days <= 0:
+    for table in tables:                       # essaie toutes les tables
+        for row in table.find_all("tr"):
+            cols = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if len(cols) < 3:
                 continue
-            if len(cols) >= 4 and date_valeur is None:
-                try:
-                    date_valeur = datetime.datetime.strptime(cols[3].strip(), "%d/%m/%Y").date()
-                except Exception:
-                    pass
-            label = f"{d.strftime('%d/%m/%Y')} ({days}j)"
-            mats.append(days)
-            rats.append(rate)
-            labels.append(label)
-        except Exception:
-            continue
+            try:
+                d      = datetime.datetime.strptime(cols[0].strip(), "%d/%m/%Y").date()
+                taux_r = cols[2].strip().replace("%","").replace(",",".").replace(" ","")
+                rate   = float(taux_r) / 100
+                days   = (d - eval_date).days
+                if days <= 0:
+                    continue
+                if len(cols) >= 4 and date_valeur is None:
+                    try:
+                        date_valeur = datetime.datetime.strptime(cols[3].strip(), "%d/%m/%Y").date()
+                    except Exception:
+                        pass
+                labels.append(_days_to_years_label(d, eval_date))
+                mats.append(days)
+                rats.append(rate)
+            except Exception as e:
+                last_err = e
+                continue
+        if len(rats) >= 2:
+            break                              # bonne table trouvée
 
     if len(rats) < 2:
-        raise ValueError("Impossible de parser les taux depuis la page BAM.")
+        raise ValueError(f"Impossible de parser les taux (dernière erreur: {last_err}).")
     return mats, rats, labels, date_valeur or eval_date
+
+def fetch_bam_auto(eval_date: datetime.date):
+    """
+    Télécharge la courbe BAM depuis le site officiel bkam.ma.
+    Essaie plusieurs URLs et méthodes (HTML scraping + CSV direct).
+    """
+    date_str_slash  = eval_date.strftime("%d/%m/%Y")   # 19/04/2026
+    date_str_dash   = eval_date.strftime("%Y-%m-%d")   # 2026-04-19
+    date_str_dots   = eval_date.strftime("%d.%m.%Y")   # 19.04.2026
+
+    base_headers = {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-MA,fr;q=0.9,fr-FR;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection":      "keep-alive",
+        "Referer":         "https://www.bkam.ma/",
+        "Cache-Control":   "no-cache",
+    }
+
+    # ── List of URLs to try (HTML pages) ──────────────────────────────
+    html_urls = [
+        # URL 1 : page standard avec paramètre date (slash-encoded)
+        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+        "Marche-des-bons-du-tresor/Marche-secondaire/"
+        f"Taux-de-reference-des-bons-du-tresor?date={date_str_slash}",
+
+        # URL 2 : variante bons-de-tresor (comme dans le VBA)
+        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+        "Marche-des-bons-de-tresor/Marche-secondaire/"
+        f"Taux-de-reference-des-bons-du-tresor?date={date_str_slash}",
+
+        # URL 3 : sans paramètre date (courbe du jour)
+        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+        "Marche-des-bons-du-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor",
+
+        # URL 4 : version anglaise
+        "https://www.bkam.ma/en/Markets/Key-indicators/Bond-market/Treasury-bills-market/"
+        "Secondary-market/Reference-rates-of-treasury-bills",
+
+        # URL 5 : date en tirets
+        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+        "Marche-des-bons-du-tresor/Marche-secondaire/"
+        f"Taux-de-reference-des-bons-du-tresor?date={date_str_dash}",
+    ]
+
+    errors = []
+    session = requests.Session()
+    session.headers.update(base_headers)
+
+    for url in html_urls:
+        try:
+            resp = session.get(url, timeout=20, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.text) > 500:
+                mats, rats, labels, dv = _parse_bam_html_table(resp.text, eval_date)
+                return mats, rats, labels, dv
+            else:
+                errors.append(f"HTTP {resp.status_code} — {url[:70]}")
+        except Exception as e:
+            errors.append(f"{type(e).__name__}: {str(e)[:60]} — {url[:70]}")
+
+    # ── Fallback: try direct CSV download endpoint ────────────────────
+    csv_urls = [
+        f"https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+        f"Marche-des-bons-du-tresor/Marche-secondaire/"
+        f"Taux-de-reference-des-bons-du-tresor?date={date_str_slash}&format=csv",
+
+        f"https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+        f"Marche-des-bons-du-tresor/Marche-secondaire/"
+        f"Taux-de-reference-des-bons-du-tresor/exportcsv?date={date_str_slash}",
+    ]
+    for url in csv_urls:
+        try:
+            resp = session.get(url, timeout=20)
+            if resp.status_code == 200 and len(resp.content) > 100:
+                mats, rats, labels, dv = parse_bam_csv(resp.content, eval_date)
+                return mats, rats, labels, dv
+            else:
+                errors.append(f"CSV HTTP {resp.status_code} — {url[:70]}")
+        except Exception as e:
+            errors.append(f"CSV {type(e).__name__}: {str(e)[:60]}")
+
+    raise ValueError(
+        "Impossible de contacter le site BAM. Détails :\n" +
+        "\n".join(f"  • {e}" for e in errors[:6])
+    )
 
 # ─────────────────────────────────────────────
 # HELPER: PARSE COURBE MANUELLE
@@ -338,7 +429,7 @@ def parse_manual_curve(text: str, eval_date: datetime.date):
             try:
                 d     = datetime.datetime.strptime(key.strip(), "%d/%m/%Y").date()
                 days  = (d - eval_date).days
-                label = f"{d.strftime('%d/%m/%Y')} ({days}j)"
+                label = _days_to_years_label(d, eval_date)
             except Exception:
                 pass
 
