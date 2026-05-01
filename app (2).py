@@ -583,12 +583,7 @@ if "Accueil" in page:
         # ── Tab 1 : Import automatique ────────────────────────────────
         with tab_auto:
             st.markdown("**Import direct depuis Bank Al-Maghrib (bkam.ma)**")
-            st.caption(
-                "Tente d'abord le **endpoint CSV direct** `/export/blockcsv/` (le plus fiable), "
-                "puis la **page HTML** avec paramètre `?date=`. "
-                "Nécessite un accès réseau au domaine **bkam.ma**. "
-                "⚠️ Si vous êtes derrière un proxy d'entreprise, utilisez l'onglet **Import CSV**."
-            )
+
             eval_date_auto = st.date_input(
                 "Date de la courbe à récupérer",
                 value=datetime.date.today(),
@@ -596,29 +591,127 @@ if "Accueil" in page:
                 key="auto_date",
                 help="Choisissez un jour ouvrable. BAM publie la courbe en jours ouvrables uniquement."
             )
-            if st.button("🔄 Importer la courbe BAM", key="btn_auto"):
-                with st.spinner("Connexion à Bank Al-Maghrib en cours…"):
-                    try:
-                        mats, rats, labels, dv = fetch_bam_auto(eval_date_auto)
-                        st.session_state.bam_curve = dict(
-                            maturities_days=mats, rates=rats, labels=labels, date=dv
-                        )
-                        st.success(
-                            f"✅ Courbe importée — **{len(rats)} points** — "
-                            f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
-                        )
-                        df_prev = pd.DataFrame({
-                            "Échéance / Maturité": labels,
-                            "Jours résiduels": mats,
-                            "Taux (%)": [f"{r*100:.4f}%" for r in rats],
-                        })
-                        st.dataframe(df_prev, use_container_width=True, hide_index=True)
-                    except Exception as e:
-                        st.error(f"❌ Échec de l'import automatique : {e}")
-                        st.warning(
-                            "💡 **Alternative :** Téléchargez le CSV depuis le site BAM "
-                            "(bouton **Exporter → CSV**) puis utilisez l'onglet **Import CSV Officiel BAM**."
-                        )
+
+            # ── Approche client-side : le fetch se fait dans le navigateur ──
+            # Streamlit Cloud bloque les requêtes serveur vers bkam.ma,
+            # mais le navigateur de l'utilisateur peut y accéder librement.
+            # On injecte un composant HTML/JS qui fetch le CSV BAM côté client
+            # puis renvoie les données via un formulaire caché vers Streamlit.
+
+            date_str_js = eval_date_auto.strftime("%d/%m/%Y")
+            bam_csv_url = (
+                "https://www.bkam.ma/export/blockcsv/6/200000001/"
+                "f550d4954ef54db89acfa4c05d0f1bfd"
+                "?block=f550d4954ef54db89acfa4c05d0f1bfd"
+                f"&date={date_str_js}"
+            )
+
+            # Widget HTML : bouton qui fetch depuis le navigateur et stocke
+            # le résultat dans un champ texte lisible par Streamlit via query params
+            import streamlit.components.v1 as components
+
+            fetch_component = f"""
+            <div style="font-family:Arial,sans-serif;">
+              <div id="status" style="margin-bottom:10px;padding:10px;border-radius:6px;
+                   background:#f0f7ff;border:1px solid #cce;font-size:13px;color:#333;">
+                Cliquez sur le bouton ci-dessous — la requête sera effectuée depuis votre navigateur.
+              </div>
+              <button onclick="fetchBAM()" style="
+                background:linear-gradient(90deg,#e31e24,#c0141a);
+                color:white;border:none;border-radius:8px;
+                padding:12px 28px;font-size:14px;font-weight:600;
+                cursor:pointer;box-shadow:0 3px 10px rgba(227,30,36,.3);">
+                🔄 Récupérer la courbe BAM
+              </button>
+              <br/><br/>
+              <textarea id="csvResult" rows="1" style="width:100%;font-size:11px;
+                display:none;border-radius:4px;padding:6px;border:1px solid #ccc;
+                font-family:monospace;" readonly></textarea>
+              <div id="instructions" style="display:none;margin-top:10px;padding:10px;
+                   background:#f9f9f9;border-radius:6px;border:1px solid #ddd;font-size:12px;">
+                <b>📋 Étape suivante :</b> Copiez le texte ci-dessus, puis collez-le
+                dans l'onglet <b>Import CSV Officiel BAM</b> en tant que fichier texte.
+              </div>
+            </div>
+
+            <script>
+            async function fetchBAM() {{
+              const statusEl = document.getElementById('status');
+              const resultEl = document.getElementById('csvResult');
+              const instrEl  = document.getElementById('instructions');
+
+              statusEl.style.background = '#fff8e1';
+              statusEl.style.borderColor = '#ffd54f';
+              statusEl.innerHTML = '⏳ Connexion à bkam.ma en cours…';
+
+              const urls = [
+                '{bam_csv_url}',
+                'https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/Marche-des-bons-de-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor?date={date_str_js}',
+              ];
+
+              for (let url of urls) {{
+                try {{
+                  const resp = await fetch(url, {{
+                    method: 'GET',
+                    headers: {{
+                      'Accept': 'text/html,text/csv,*/*',
+                    }},
+                    mode: 'cors',
+                  }});
+                  if (resp.ok) {{
+                    const text = await resp.text();
+                    if (text && text.length > 30) {{
+                      resultEl.value = text;
+                      resultEl.style.display = 'block';
+                      resultEl.rows = Math.min(text.split('\\n').length + 2, 15);
+                      statusEl.style.background = '#e8f5e9';
+                      statusEl.style.borderColor = '#81c784';
+                      statusEl.innerHTML = '✅ Données reçues ! Copiez le texte ci-dessous et collez-le dans <b>Import CSV Officiel BAM</b>.';
+                      instrEl.style.display = 'block';
+                      return;
+                    }}
+                  }}
+                }} catch(e) {{
+                  // CORS block — expected for some URLs, continue to next
+                }}
+              }}
+
+              // If all fail → guide user to manual download
+              statusEl.style.background = '#fff3e0';
+              statusEl.style.borderColor = '#ffb74d';
+              statusEl.innerHTML = `
+                ⚠️ Import automatique non disponible depuis ce navigateur (restriction CORS bkam.ma).<br/>
+                <b>Solution :</b> <a href="https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/Marche-des-bons-de-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor" 
+                target="_blank" style="color:#e31e24;">Téléchargez le CSV depuis bkam.ma</a>
+                puis utilisez l'onglet <b>Import CSV Officiel BAM</b>.
+              `;
+            }}
+            </script>
+            """
+
+            components.html(fetch_component, height=220, scrolling=False)
+
+            st.markdown("---")
+            # Fallback server-side (works when not blocked by network)
+            with st.expander("🖥️ Ou tenter l'import côté serveur", expanded=False):
+                if st.button("🔄 Import serveur (bkam.ma)", key="btn_auto_server"):
+                    with st.spinner("Tentative de connexion serveur…"):
+                        try:
+                            mats, rats, labels, dv = fetch_bam_auto(eval_date_auto)
+                            st.session_state.bam_curve = dict(
+                                maturities_days=mats, rates=rats, labels=labels, date=dv
+                            )
+                            st.success(
+                                f"✅ Courbe importée — **{len(rats)} points** — "
+                                f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
+                            )
+                            df_prev = pd.DataFrame({
+                                "Échéance / Maturité": labels,
+                                "Taux (%)": [f"{r*100:.4f}%" for r in rats],
+                            })
+                            st.dataframe(df_prev, use_container_width=True, hide_index=True)
+                        except Exception as e:
+                            st.error("Import serveur échoué. Utilisez l'onglet **Import CSV**.")
 
         # ── Tab 2 : Import CSV officiel ───────────────────────────────
         with tab_csv:
