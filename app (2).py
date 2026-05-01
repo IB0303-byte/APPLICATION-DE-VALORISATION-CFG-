@@ -271,8 +271,22 @@ def parse_bam_csv(file_content: bytes, eval_date: datetime.date):
 
 # ─────────────────────────────────────────────
 # HELPER: FETCH BAM AUTOMATIQUE
-# Essaie plusieurs URLs officielles BAM (HTML + CSV direct)
 # ─────────────────────────────────────────────
+
+# URL exacte du endpoint CSV de BAM (découvert via inspection du site)
+# Format: /export/blockcsv/{page_id}/{hash_page}/{hash_block}?block={hash_block}
+# Ces hashes sont fixes et stables — ils identifient le bloc "Taux de référence BDT"
+_BAM_CSV_URL = (
+    "https://www.bkam.ma/export/blockcsv/6/200000001/f550d4954ef54db89acfa4c05d0f1bfd"
+    "?block=f550d4954ef54db89acfa4c05d0f1bfd"
+)
+
+# URL HTML de la page officielle (bons-de-tresor — chemin correct confirmé)
+_BAM_HTML_BASE = (
+    "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+    "Marche-des-bons-de-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor"
+)
+
 def _parse_bam_html_table(html_text: str, eval_date: datetime.date):
     """Parse une page HTML BAM et extrait la courbe de taux."""
     soup   = BeautifulSoup(html_text, "html.parser")
@@ -282,9 +296,8 @@ def _parse_bam_html_table(html_text: str, eval_date: datetime.date):
 
     mats, rats, labels = [], [], []
     date_valeur = None
-    last_err = None
 
-    for table in tables:                       # essaie toutes les tables
+    for table in tables:
         for row in table.find_all("tr"):
             cols = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
             if len(cols) < 3:
@@ -304,101 +317,95 @@ def _parse_bam_html_table(html_text: str, eval_date: datetime.date):
                 labels.append(_days_to_years_label(d, eval_date))
                 mats.append(days)
                 rats.append(rate)
-            except Exception as e:
-                last_err = e
+            except Exception:
                 continue
         if len(rats) >= 2:
-            break                              # bonne table trouvée
+            break
 
     if len(rats) < 2:
-        raise ValueError(f"Impossible de parser les taux (dernière erreur: {last_err}).")
+        raise ValueError("Impossible de parser les taux depuis le HTML.")
     return mats, rats, labels, date_valeur or eval_date
+
 
 def fetch_bam_auto(eval_date: datetime.date):
     """
-    Télécharge la courbe BAM depuis le site officiel bkam.ma.
-    Essaie plusieurs URLs et méthodes (HTML scraping + CSV direct).
-    """
-    date_str_slash  = eval_date.strftime("%d/%m/%Y")   # 19/04/2026
-    date_str_dash   = eval_date.strftime("%Y-%m-%d")   # 2026-04-19
-    date_str_dots   = eval_date.strftime("%d.%m.%Y")   # 19.04.2026
+    Télécharge la courbe BAM depuis bkam.ma.
 
-    base_headers = {
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    Stratégie (ordre de priorité) :
+    1. CSV direct via l'endpoint /export/blockcsv/ (le plus fiable — contourne
+       le JavaScript et le cookie-wall de la page HTML principale)
+    2. Page HTML avec paramètre ?date= (plusieurs variantes d'URL)
+    3. Page HTML sans date (courbe du jour)
+    """
+    date_str = eval_date.strftime("%d/%m/%Y")   # ex: 19/04/2026
+
+    headers = {
+        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/124.0.0.0 Safari/537.36",
+        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "fr-MA,fr;q=0.9,fr-FR;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection":      "keep-alive",
         "Referer":         "https://www.bkam.ma/",
         "Cache-Control":   "no-cache",
     }
 
-    # ── List of URLs to try (HTML pages) ──────────────────────────────
-    html_urls = [
-        # URL 1 : page standard avec paramètre date (slash-encoded)
-        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        "Marche-des-bons-du-tresor/Marche-secondaire/"
-        f"Taux-de-reference-des-bons-du-tresor?date={date_str_slash}",
-
-        # URL 2 : variante bons-de-tresor (comme dans le VBA)
-        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        "Marche-des-bons-de-tresor/Marche-secondaire/"
-        f"Taux-de-reference-des-bons-du-tresor?date={date_str_slash}",
-
-        # URL 3 : sans paramètre date (courbe du jour)
-        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        "Marche-des-bons-du-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor",
-
-        # URL 4 : version anglaise
-        "https://www.bkam.ma/en/Markets/Key-indicators/Bond-market/Treasury-bills-market/"
-        "Secondary-market/Reference-rates-of-treasury-bills",
-
-        # URL 5 : date en tirets
-        "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        "Marche-des-bons-du-tresor/Marche-secondaire/"
-        f"Taux-de-reference-des-bons-du-tresor?date={date_str_dash}",
-    ]
+    session = requests.Session()
+    session.headers.update(headers)
 
     errors = []
-    session = requests.Session()
-    session.headers.update(base_headers)
 
+    # ── 1. Endpoint CSV direct (le plus fiable) ───────────────────────
+    # Cet endpoint exporte directement le tableau sans JavaScript
+    # On ajoute le paramètre date pour filtrer
+    csv_endpoints = [
+        f"{_BAM_CSV_URL}&date={date_str}",
+        _BAM_CSV_URL,  # sans filtre date → courbe du dernier jour disponible
+    ]
+    for url in csv_endpoints:
+        try:
+            resp = session.get(url, timeout=25, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.content) > 50:
+                try:
+                    m, r, l, dv = parse_bam_csv(resp.content, eval_date)
+                    return m, r, l, dv
+                except Exception as e:
+                    errors.append(f"CSV parse error: {e}")
+            else:
+                errors.append(f"CSV HTTP {resp.status_code} ({url[:65]})")
+        except Exception as e:
+            errors.append(f"CSV request error: {str(e)[:70]}")
+
+    # ── 2. Page HTML avec paramètre ?date= ───────────────────────────
+    html_urls = [
+        f"{_BAM_HTML_BASE}?date={date_str}",
+        f"https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+        f"Marche-des-bons-du-tresor/Marche-secondaire/"
+        f"Taux-de-reference-des-bons-du-tresor?date={date_str}",
+        _BAM_HTML_BASE,   # sans date → courbe du jour
+    ]
     for url in html_urls:
         try:
-            resp = session.get(url, timeout=20, allow_redirects=True)
-            if resp.status_code == 200 and len(resp.text) > 500:
-                mats, rats, labels, dv = _parse_bam_html_table(resp.text, eval_date)
-                return mats, rats, labels, dv
+            resp = session.get(url, timeout=25, allow_redirects=True)
+            if resp.status_code == 200 and len(resp.text) > 200:
+                try:
+                    m, r, l, dv = _parse_bam_html_table(resp.text, eval_date)
+                    return m, r, l, dv
+                except Exception as e:
+                    errors.append(f"HTML parse error: {e} ({url[:65]})")
             else:
-                errors.append(f"HTTP {resp.status_code} — {url[:70]}")
+                errors.append(f"HTML HTTP {resp.status_code} ({url[:65]})")
         except Exception as e:
-            errors.append(f"{type(e).__name__}: {str(e)[:60]} — {url[:70]}")
-
-    # ── Fallback: try direct CSV download endpoint ────────────────────
-    csv_urls = [
-        f"https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        f"Marche-des-bons-du-tresor/Marche-secondaire/"
-        f"Taux-de-reference-des-bons-du-tresor?date={date_str_slash}&format=csv",
-
-        f"https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        f"Marche-des-bons-du-tresor/Marche-secondaire/"
-        f"Taux-de-reference-des-bons-du-tresor/exportcsv?date={date_str_slash}",
-    ]
-    for url in csv_urls:
-        try:
-            resp = session.get(url, timeout=20)
-            if resp.status_code == 200 and len(resp.content) > 100:
-                mats, rats, labels, dv = parse_bam_csv(resp.content, eval_date)
-                return mats, rats, labels, dv
-            else:
-                errors.append(f"CSV HTTP {resp.status_code} — {url[:70]}")
-        except Exception as e:
-            errors.append(f"CSV {type(e).__name__}: {str(e)[:60]}")
+            errors.append(f"HTML request error: {str(e)[:70]}")
 
     raise ValueError(
-        "Impossible de contacter le site BAM. Détails :\n" +
-        "\n".join(f"  • {e}" for e in errors[:6])
+        "Impossible de charger la courbe BAM automatiquement.\n\n"
+        "**Causes possibles :**\n"
+        "- Le site bkam.ma est temporairement indisponible\n"
+        "- Pas de courbe publiée pour cette date (week-end, jour férié)\n"
+        "- Restriction réseau (ex: proxy d'entreprise)\n\n"
+        "**Solution :** Utilisez l'onglet **Import CSV Officiel BAM** "
+        "pour charger manuellement le fichier téléchargé depuis bkam.ma.\n\n"
+        f"Détails techniques : {' | '.join(errors[:4])}"
     )
 
 # ─────────────────────────────────────────────
@@ -575,19 +582,22 @@ if "Accueil" in page:
 
         # ── Tab 1 : Import automatique ────────────────────────────────
         with tab_auto:
-            st.markdown("**Import direct depuis le site Bank Al-Maghrib**")
+            st.markdown("**Import direct depuis Bank Al-Maghrib (bkam.ma)**")
             st.caption(
-                "Utilise exactement l'URL du code VBA officiel BAM avec le paramètre `?date=DD/MM/YYYY`. "
-                "Nécessite un accès réseau au domaine **bkam.ma**."
+                "Tente d'abord le **endpoint CSV direct** `/export/blockcsv/` (le plus fiable), "
+                "puis la **page HTML** avec paramètre `?date=`. "
+                "Nécessite un accès réseau au domaine **bkam.ma**. "
+                "⚠️ Si vous êtes derrière un proxy d'entreprise, utilisez l'onglet **Import CSV**."
             )
             eval_date_auto = st.date_input(
                 "Date de la courbe à récupérer",
                 value=datetime.date.today(),
                 format="DD/MM/YYYY",
                 key="auto_date",
+                help="Choisissez un jour ouvrable. BAM publie la courbe en jours ouvrables uniquement."
             )
-            if st.button("🔄 Importer depuis bkam.ma", key="btn_auto"):
-                with st.spinner("Connexion à Bank Al-Maghrib…"):
+            if st.button("🔄 Importer la courbe BAM", key="btn_auto"):
+                with st.spinner("Connexion à Bank Al-Maghrib en cours…"):
                     try:
                         mats, rats, labels, dv = fetch_bam_auto(eval_date_auto)
                         st.session_state.bam_curve = dict(
