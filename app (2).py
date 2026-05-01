@@ -97,8 +97,8 @@ st.markdown(f"""
 <div class="cfg-header">
     {logo_html}
     <div>
-        <h1>Système de Valorisation OPCVM</h1>
-        <p>Conforme à la Circulaire CDVM N°02/04 – Titres de créances à taux fixe remboursables in fine</p>
+        <h1>Dispositif de Valorisation </h1>
+        <p>Conforme à la réglémentation AMMC</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -110,11 +110,11 @@ st.markdown("""
     <span style="font-size:.82rem; color:#555;">
         <b style="color:#1a1a2e;">ℹ️ En cas de besoin, contacter :</b>
         &nbsp;&nbsp;
-        <b>JEAN MATA</b>
+        <b>THIERNO IBRAHIMA DIALLO </b>
         &nbsp;|&nbsp;
-        📞 <a href="tel:+33987238238" style="color:#e31e24;text-decoration:none;">+33 987 238 238</a>
+        📞 <a href="tel:0648532777" style="color:#e31e24;text-decoration:none;">0648532777</a>
         &nbsp;|&nbsp;
-        ✉️ <a href="mailto:jean@gmail.com" style="color:#e31e24;text-decoration:none;">jean@gmail.com</a>
+        ✉️ <a href="mailto:thibdiallo01@gmail.com" style="color:#e31e24;text-decoration:none;">thibdiallo01@gmail.com</a>
     </span>
 </div>
 """, unsafe_allow_html=True)
@@ -148,7 +148,7 @@ with st.sidebar:
     st.markdown(f"""
     <div style="font-size:.82rem;color:#ccc;line-height:1.8">
     <b>Date :</b> {datetime.date.today().strftime('%d/%m/%Y')}<br/>
-    <b>Référentiel :</b> Circulaire CDVM N°02/04<br/>
+    <b>Référentiel :</b> Circulaire de l'AMMC<br/>
     <b>Source taux :</b> Bank Al-Maghrib
     </div>
     """, unsafe_allow_html=True)
