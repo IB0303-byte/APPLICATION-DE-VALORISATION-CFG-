@@ -609,92 +609,12 @@ if "Accueil" in page:
     with col_main:
         st.markdown('<div class="section-title">📡 Importation de la Courbe des Taux BAM</div>', unsafe_allow_html=True)
 
-        tab_auto, tab_csv, tab_manual = st.tabs([
-            "🤖 Import Automatique",
+        tab_csv, tab_manual = st.tabs([
             "📁 Import CSV BAM",
             "✏️ Saisie Manuelle",
         ])
 
-        # ── Tab 1 : Import automatique via Claude API ─────────────────
-        with tab_auto:
-            st.markdown("**Import automatique via l'API Claude (web search)**")
-            st.info(
-                "Claude utilise son accès internet pour récupérer directement "
-                "la courbe publiée par Bank Al-Maghrib. "
-                "Vous avez besoin d'une **clé API Anthropic** (gratuite sur console.anthropic.com)."
-            )
-
-            col1, col2 = st.columns([2, 1])
-            with col1:
-                api_key_input = st.text_input(
-                    "🔑 Clé API Anthropic",
-                    type="password",
-                    placeholder="sk-ant-api03-...",
-                    help="Obtenez votre clé sur https://console.anthropic.com/settings/keys",
-                    key="anthropic_key",
-                )
-            with col2:
-                eval_date_auto = st.date_input(
-                    "📅 Date de la courbe",
-                    value=datetime.date.today(),
-                    format="DD/MM/YYYY",
-                    key="auto_date",
-                    help="Jour ouvrable. BAM publie la courbe en jours ouvrables uniquement."
-                )
-
-            col_btn, col_direct = st.columns([1, 1])
-            with col_btn:
-                run_auto = st.button(
-                    "🚀 Importer la courbe BAM",
-                    key="btn_auto_claude",
-                    use_container_width=True,
-                    disabled=not api_key_input,
-                )
-            with col_direct:
-                # Also try direct (works locally)
-                run_direct = st.button(
-                    "🔄 Import direct (local/VPN)",
-                    key="btn_auto_direct",
-                    use_container_width=True,
-                )
-
-            if run_auto and api_key_input:
-                with st.spinner("Claude recherche la courbe BAM sur bkam.ma…"):
-                    try:
-                        mats, rats, labels, dv = fetch_bam_via_anthropic(eval_date_auto, api_key_input)
-                        st.session_state.bam_curve = dict(
-                            maturities_days=mats, rates=rats, labels=labels, date=dv
-                        )
-                        st.success(
-                            f"✅ Courbe importée — **{len(rats)} points** — "
-                            f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
-                        )
-                        st.dataframe(
-                            pd.DataFrame({"Échéance": labels, "Taux (%)": [f"{r*100:.4f}%" for r in rats]}),
-                            use_container_width=True, hide_index=True
-                        )
-                    except Exception as e:
-                        st.error(f"❌ {e}")
-
-            if run_direct:
-                with st.spinner("Tentative de connexion directe à bkam.ma…"):
-                    try:
-                        mats, rats, labels, dv = fetch_bam_direct(eval_date_auto)
-                        st.session_state.bam_curve = dict(
-                            maturities_days=mats, rates=rats, labels=labels, date=dv
-                        )
-                        st.success(
-                            f"✅ Courbe importée — **{len(rats)} points** — "
-                            f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
-                        )
-                        st.dataframe(
-                            pd.DataFrame({"Échéance": labels, "Taux (%)": [f"{r*100:.4f}%" for r in rats]}),
-                            use_container_width=True, hide_index=True
-                        )
-                    except Exception as e:
-                        st.warning(f"Import direct non disponible depuis ce serveur. Utilisez l'onglet **Import CSV BAM**.")
-
-        # ── Tab 2 : Import CSV officiel ───────────────────────────────
+        # ── Tab 1 : Import CSV officiel ───────────────────────────────
         with tab_csv:
             # Lien direct + instructions visuelles en haut
             bam_page_url = (
