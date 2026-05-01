@@ -270,19 +270,12 @@ def parse_bam_csv(file_content: bytes, eval_date: datetime.date):
     return mats, rats, labels, date_valeur or eval_date
 
 # ─────────────────────────────────────────────
-# HELPER: FETCH BAM AUTOMATIQUE
+# HELPER: FETCH BAM via ANTHROPIC API (proxy)
+# L'API Anthropic est accessible depuis Streamlit Cloud.
+# On demande à Claude de récupérer et retourner la courbe BAM.
 # ─────────────────────────────────────────────
 
-# URL exacte du endpoint CSV de BAM (découvert via inspection du site)
-# Format: /export/blockcsv/{page_id}/{hash_page}/{hash_block}?block={hash_block}
-# Ces hashes sont fixes et stables — ils identifient le bloc "Taux de référence BDT"
-_BAM_CSV_URL = (
-    "https://www.bkam.ma/export/blockcsv/6/200000001/f550d4954ef54db89acfa4c05d0f1bfd"
-    "?block=f550d4954ef54db89acfa4c05d0f1bfd"
-)
-
-# URL HTML de la page officielle (bons-de-tresor — chemin correct confirmé)
-_BAM_HTML_BASE = (
+_BAM_PAGE_URL = (
     "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
     "Marche-des-bons-de-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor"
 )
@@ -293,10 +286,8 @@ def _parse_bam_html_table(html_text: str, eval_date: datetime.date):
     tables = soup.find_all("table")
     if not tables:
         raise ValueError("Aucune table trouvée dans la réponse HTML.")
-
     mats, rats, labels = [], [], []
     date_valeur = None
-
     for table in tables:
         for row in table.find_all("tr"):
             cols = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
@@ -321,92 +312,140 @@ def _parse_bam_html_table(html_text: str, eval_date: datetime.date):
                 continue
         if len(rats) >= 2:
             break
-
     if len(rats) < 2:
         raise ValueError("Impossible de parser les taux depuis le HTML.")
     return mats, rats, labels, date_valeur or eval_date
 
 
-def fetch_bam_auto(eval_date: datetime.date):
+def fetch_bam_via_anthropic(eval_date: datetime.date, api_key: str):
     """
-    Télécharge la courbe BAM depuis bkam.ma.
-
-    Stratégie (ordre de priorité) :
-    1. CSV direct via l'endpoint /export/blockcsv/ (le plus fiable — contourne
-       le JavaScript et le cookie-wall de la page HTML principale)
-    2. Page HTML avec paramètre ?date= (plusieurs variantes d'URL)
-    3. Page HTML sans date (courbe du jour)
+    Utilise l'API Claude avec l'outil web_search pour récupérer
+    la courbe BAM du jour. Retourne (mats, rats, labels, date_valeur).
     """
-    date_str = eval_date.strftime("%d/%m/%Y")   # ex: 19/04/2026
+    import json
 
-    headers = {
-        "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                           "AppleWebKit/537.36 (KHTML, like Gecko) "
-                           "Chrome/124.0.0.0 Safari/537.36",
-        "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
-        "Accept-Language": "fr-MA,fr;q=0.9,fr-FR;q=0.8,en;q=0.7",
-        "Referer":         "https://www.bkam.ma/",
-        "Cache-Control":   "no-cache",
+    date_str = eval_date.strftime("%d/%m/%Y")
+
+    prompt = f"""Tu dois récupérer la courbe des taux de référence des bons du Trésor 
+publiée par Bank Al-Maghrib (BAM) pour la date du {date_str}.
+
+URL officielle: {_BAM_PAGE_URL}?date={date_str}
+
+Utilise l'outil web_search pour accéder à cette page et extraire le tableau des taux.
+Le tableau contient des colonnes: Date d'échéance, Transaction, Taux moyen pondéré, Date de la valeur.
+
+Retourne UNIQUEMENT un JSON valide (sans aucun autre texte) avec cette structure exacte:
+{{
+  "date_valeur": "JJ/MM/AAAA",
+  "points": [
+    {{"echeance": "JJ/MM/AAAA", "taux": 2.250}},
+    ...
+  ]
+}}
+Les taux sont en pourcentage (ex: 2.250 signifie 2.250%).
+"""
+
+    payload = {
+        "model": "claude-opus-4-5",
+        "max_tokens": 1024,
+        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+        "messages": [{"role": "user", "content": prompt}]
     }
 
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "web-search-2025-03-05",
+            "content-type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Extract text response
+    text = ""
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            text += block.get("text", "")
+
+    # Parse JSON from response
+    text = text.strip()
+    # Strip markdown code fences if present
+    if "```" in text:
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    result = json.loads(text)
+    points = result.get("points", [])
+    date_valeur_str = result.get("date_valeur", date_str)
+
+    try:
+        date_valeur = datetime.datetime.strptime(date_valeur_str, "%d/%m/%Y").date()
+    except Exception:
+        date_valeur = eval_date
+
+    mats, rats, labels = [], [], []
+    for pt in points:
+        try:
+            d    = datetime.datetime.strptime(pt["echeance"], "%d/%m/%Y").date()
+            rate = float(pt["taux"]) / 100
+            days = (d - eval_date).days
+            if days <= 0:
+                continue
+            mats.append(days)
+            rats.append(rate)
+            labels.append(_days_to_years_label(d, eval_date))
+        except Exception:
+            continue
+
+    if len(rats) < 2:
+        raise ValueError("L'API Claude n'a pas pu extraire suffisamment de points de taux.")
+
+    return mats, rats, labels, date_valeur
+
+
+def fetch_bam_direct(eval_date: datetime.date):
+    """
+    Tentative directe via requests (fonctionne en local ou si le réseau le permet).
+    """
+    date_str = eval_date.strftime("%d/%m/%Y")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,*/*;q=0.8",
+        "Accept-Language": "fr-MA,fr;q=0.9",
+        "Referer": "https://www.bkam.ma/",
+    }
     session = requests.Session()
     session.headers.update(headers)
 
+    urls = [
+        f"{_BAM_PAGE_URL}?date={date_str}",
+        _BAM_PAGE_URL,
+        (
+            "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+            f"Marche-des-bons-du-tresor/Marche-secondaire/"
+            f"Taux-de-reference-des-bons-du-tresor?date={date_str}"
+        ),
+    ]
     errors = []
-
-    # ── 1. Endpoint CSV direct (le plus fiable) ───────────────────────
-    # Cet endpoint exporte directement le tableau sans JavaScript
-    # On ajoute le paramètre date pour filtrer
-    csv_endpoints = [
-        f"{_BAM_CSV_URL}&date={date_str}",
-        _BAM_CSV_URL,  # sans filtre date → courbe du dernier jour disponible
-    ]
-    for url in csv_endpoints:
+    for url in urls:
         try:
-            resp = session.get(url, timeout=25, allow_redirects=True)
-            if resp.status_code == 200 and len(resp.content) > 50:
-                try:
-                    m, r, l, dv = parse_bam_csv(resp.content, eval_date)
-                    return m, r, l, dv
-                except Exception as e:
-                    errors.append(f"CSV parse error: {e}")
-            else:
-                errors.append(f"CSV HTTP {resp.status_code} ({url[:65]})")
-        except Exception as e:
-            errors.append(f"CSV request error: {str(e)[:70]}")
-
-    # ── 2. Page HTML avec paramètre ?date= ───────────────────────────
-    html_urls = [
-        f"{_BAM_HTML_BASE}?date={date_str}",
-        f"https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
-        f"Marche-des-bons-du-tresor/Marche-secondaire/"
-        f"Taux-de-reference-des-bons-du-tresor?date={date_str}",
-        _BAM_HTML_BASE,   # sans date → courbe du jour
-    ]
-    for url in html_urls:
-        try:
-            resp = session.get(url, timeout=25, allow_redirects=True)
+            resp = session.get(url, timeout=20, allow_redirects=True)
             if resp.status_code == 200 and len(resp.text) > 200:
-                try:
-                    m, r, l, dv = _parse_bam_html_table(resp.text, eval_date)
-                    return m, r, l, dv
-                except Exception as e:
-                    errors.append(f"HTML parse error: {e} ({url[:65]})")
-            else:
-                errors.append(f"HTML HTTP {resp.status_code} ({url[:65]})")
+                return _parse_bam_html_table(resp.text, eval_date)
+            errors.append(f"HTTP {resp.status_code}")
         except Exception as e:
-            errors.append(f"HTML request error: {str(e)[:70]}")
+            errors.append(str(e)[:50])
+    raise ValueError(" | ".join(errors))
 
-    raise ValueError(
-        "Impossible de charger la courbe BAM automatiquement.\n\n"
-        "**Causes possibles :**\n"
-        "- Le site bkam.ma est temporairement indisponible\n"
-        "- Pas de courbe publiée pour cette date (week-end, jour férié)\n"
-        "- Restriction réseau (ex: proxy d'entreprise)\n\n"
-        "**Solution :** Utilisez l'onglet **Import CSV Officiel BAM** "
-        "pour charger manuellement le fichier téléchargé depuis bkam.ma.\n\n"
-        f"Détails techniques : {' | '.join(errors[:4])}"
-    )
+
 
 # ─────────────────────────────────────────────
 # HELPER: PARSE COURBE MANUELLE
@@ -569,177 +608,140 @@ if "Accueil" in page:
 
     with col_main:
         st.markdown('<div class="section-title">📡 Importation de la Courbe des Taux BAM</div>', unsafe_allow_html=True)
-        st.info(
-            "La courbe des taux est publiée quotidiennement par Bank Al-Maghrib. "
-            "Choisissez l'une des 3 méthodes ci-dessous."
-        )
 
         tab_auto, tab_csv, tab_manual = st.tabs([
-            "🌐 Import Automatique (site BAM)",
-            "📁 Import CSV Officiel BAM",
+            "🤖 Import Automatique",
+            "📁 Import CSV BAM",
             "✏️ Saisie Manuelle",
         ])
 
-        # ── Tab 1 : Import automatique ────────────────────────────────
+        # ── Tab 1 : Import automatique via Claude API ─────────────────
         with tab_auto:
-            st.markdown("**Import direct depuis Bank Al-Maghrib (bkam.ma)**")
-
-            eval_date_auto = st.date_input(
-                "Date de la courbe à récupérer",
-                value=datetime.date.today(),
-                format="DD/MM/YYYY",
-                key="auto_date",
-                help="Choisissez un jour ouvrable. BAM publie la courbe en jours ouvrables uniquement."
-            )
-
-            # ── Approche client-side : le fetch se fait dans le navigateur ──
-            # Streamlit Cloud bloque les requêtes serveur vers bkam.ma,
-            # mais le navigateur de l'utilisateur peut y accéder librement.
-            # On injecte un composant HTML/JS qui fetch le CSV BAM côté client
-            # puis renvoie les données via un formulaire caché vers Streamlit.
-
-            date_str_js = eval_date_auto.strftime("%d/%m/%Y")
-            bam_csv_url = (
-                "https://www.bkam.ma/export/blockcsv/6/200000001/"
-                "f550d4954ef54db89acfa4c05d0f1bfd"
-                "?block=f550d4954ef54db89acfa4c05d0f1bfd"
-                f"&date={date_str_js}"
-            )
-
-            # Widget HTML : bouton qui fetch depuis le navigateur et stocke
-            # le résultat dans un champ texte lisible par Streamlit via query params
-            import streamlit.components.v1 as components
-
-            fetch_component = f"""
-            <div style="font-family:Arial,sans-serif;">
-              <div id="status" style="margin-bottom:10px;padding:10px;border-radius:6px;
-                   background:#f0f7ff;border:1px solid #cce;font-size:13px;color:#333;">
-                Cliquez sur le bouton ci-dessous — la requête sera effectuée depuis votre navigateur.
-              </div>
-              <button onclick="fetchBAM()" style="
-                background:linear-gradient(90deg,#e31e24,#c0141a);
-                color:white;border:none;border-radius:8px;
-                padding:12px 28px;font-size:14px;font-weight:600;
-                cursor:pointer;box-shadow:0 3px 10px rgba(227,30,36,.3);">
-                🔄 Récupérer la courbe BAM
-              </button>
-              <br/><br/>
-              <textarea id="csvResult" rows="1" style="width:100%;font-size:11px;
-                display:none;border-radius:4px;padding:6px;border:1px solid #ccc;
-                font-family:monospace;" readonly></textarea>
-              <div id="instructions" style="display:none;margin-top:10px;padding:10px;
-                   background:#f9f9f9;border-radius:6px;border:1px solid #ddd;font-size:12px;">
-                <b>📋 Étape suivante :</b> Copiez le texte ci-dessus, puis collez-le
-                dans l'onglet <b>Import CSV Officiel BAM</b> en tant que fichier texte.
-              </div>
-            </div>
-
-            <script>
-            async function fetchBAM() {{
-              const statusEl = document.getElementById('status');
-              const resultEl = document.getElementById('csvResult');
-              const instrEl  = document.getElementById('instructions');
-
-              statusEl.style.background = '#fff8e1';
-              statusEl.style.borderColor = '#ffd54f';
-              statusEl.innerHTML = '⏳ Connexion à bkam.ma en cours…';
-
-              const urls = [
-                '{bam_csv_url}',
-                'https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/Marche-des-bons-de-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor?date={date_str_js}',
-              ];
-
-              for (let url of urls) {{
-                try {{
-                  const resp = await fetch(url, {{
-                    method: 'GET',
-                    headers: {{
-                      'Accept': 'text/html,text/csv,*/*',
-                    }},
-                    mode: 'cors',
-                  }});
-                  if (resp.ok) {{
-                    const text = await resp.text();
-                    if (text && text.length > 30) {{
-                      resultEl.value = text;
-                      resultEl.style.display = 'block';
-                      resultEl.rows = Math.min(text.split('\\n').length + 2, 15);
-                      statusEl.style.background = '#e8f5e9';
-                      statusEl.style.borderColor = '#81c784';
-                      statusEl.innerHTML = '✅ Données reçues ! Copiez le texte ci-dessous et collez-le dans <b>Import CSV Officiel BAM</b>.';
-                      instrEl.style.display = 'block';
-                      return;
-                    }}
-                  }}
-                }} catch(e) {{
-                  // CORS block — expected for some URLs, continue to next
-                }}
-              }}
-
-              // If all fail → guide user to manual download
-              statusEl.style.background = '#fff3e0';
-              statusEl.style.borderColor = '#ffb74d';
-              statusEl.innerHTML = `
-                ⚠️ Import automatique non disponible depuis ce navigateur (restriction CORS bkam.ma).<br/>
-                <b>Solution :</b> <a href="https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/Marche-des-bons-de-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor" 
-                target="_blank" style="color:#e31e24;">Téléchargez le CSV depuis bkam.ma</a>
-                puis utilisez l'onglet <b>Import CSV Officiel BAM</b>.
-              `;
-            }}
-            </script>
-            """
-
-            components.html(fetch_component, height=220, scrolling=False)
-
-            st.markdown("---")
-            # Fallback server-side (works when not blocked by network)
-            with st.expander("🖥️ Ou tenter l'import côté serveur", expanded=False):
-                if st.button("🔄 Import serveur (bkam.ma)", key="btn_auto_server"):
-                    with st.spinner("Tentative de connexion serveur…"):
-                        try:
-                            mats, rats, labels, dv = fetch_bam_auto(eval_date_auto)
-                            st.session_state.bam_curve = dict(
-                                maturities_days=mats, rates=rats, labels=labels, date=dv
-                            )
-                            st.success(
-                                f"✅ Courbe importée — **{len(rats)} points** — "
-                                f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
-                            )
-                            df_prev = pd.DataFrame({
-                                "Échéance / Maturité": labels,
-                                "Taux (%)": [f"{r*100:.4f}%" for r in rats],
-                            })
-                            st.dataframe(df_prev, use_container_width=True, hide_index=True)
-                        except Exception as e:
-                            st.error("Import serveur échoué. Utilisez l'onglet **Import CSV**.")
-
-        # ── Tab 2 : Import CSV officiel ───────────────────────────────
-        with tab_csv:
-            st.markdown("**Importez le fichier CSV téléchargé depuis bkam.ma**")
-
-            # How-to guide
-            with st.expander("📖 Comment télécharger le CSV depuis BAM ?", expanded=False):
-                st.markdown("""
-1. Allez sur [bkam.ma → Marchés → Bons du Trésor → Taux de référence](https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/Marche-des-bons-du-tresor/Marche-secondaire/Taux-de-reference-des-bons-du-tresor)
-2. Sélectionnez la **date souhaitée** via le calendrier
-3. Cliquez sur **Exporter** puis **CSV**
-4. Le fichier téléchargé s'appelle : `Taux-de-reference-des-bons-du-tresor_JJ_MM_AAAA-HH_MM.csv`
-                """)
-            st.caption(
-                "Format attendu (séparateur `;`) :\n"
-                "`\"Date d'échéance\";Transaction;\"Taux moyen pondéré\";\"Date de la valeur\"`\n"
-                "Exemple : `18/05/2026;0,00;\"2,250 %\";16/04/2026`"
+            st.markdown("**Import automatique via l'API Claude (web search)**")
+            st.info(
+                "Claude utilise son accès internet pour récupérer directement "
+                "la courbe publiée par Bank Al-Maghrib. "
+                "Vous avez besoin d'une **clé API Anthropic** (gratuite sur console.anthropic.com)."
             )
 
             col1, col2 = st.columns([2, 1])
             with col1:
-                uploaded_csv = st.file_uploader(
-                    "Fichier CSV BAM",
-                    type=["csv", "txt"],
-                    key="bam_csv_upload",
-                    help="Fichier CSV officiel BAM (ex: Taux-de-reference-des-bons-du-tresor_19_04_2026-00_53.csv)",
+                api_key_input = st.text_input(
+                    "🔑 Clé API Anthropic",
+                    type="password",
+                    placeholder="sk-ant-api03-...",
+                    help="Obtenez votre clé sur https://console.anthropic.com/settings/keys",
+                    key="anthropic_key",
                 )
             with col2:
+                eval_date_auto = st.date_input(
+                    "📅 Date de la courbe",
+                    value=datetime.date.today(),
+                    format="DD/MM/YYYY",
+                    key="auto_date",
+                    help="Jour ouvrable. BAM publie la courbe en jours ouvrables uniquement."
+                )
+
+            col_btn, col_direct = st.columns([1, 1])
+            with col_btn:
+                run_auto = st.button(
+                    "🚀 Importer la courbe BAM",
+                    key="btn_auto_claude",
+                    use_container_width=True,
+                    disabled=not api_key_input,
+                )
+            with col_direct:
+                # Also try direct (works locally)
+                run_direct = st.button(
+                    "🔄 Import direct (local/VPN)",
+                    key="btn_auto_direct",
+                    use_container_width=True,
+                )
+
+            if run_auto and api_key_input:
+                with st.spinner("Claude recherche la courbe BAM sur bkam.ma…"):
+                    try:
+                        mats, rats, labels, dv = fetch_bam_via_anthropic(eval_date_auto, api_key_input)
+                        st.session_state.bam_curve = dict(
+                            maturities_days=mats, rates=rats, labels=labels, date=dv
+                        )
+                        st.success(
+                            f"✅ Courbe importée — **{len(rats)} points** — "
+                            f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
+                        )
+                        st.dataframe(
+                            pd.DataFrame({"Échéance": labels, "Taux (%)": [f"{r*100:.4f}%" for r in rats]}),
+                            use_container_width=True, hide_index=True
+                        )
+                    except Exception as e:
+                        st.error(f"❌ {e}")
+
+            if run_direct:
+                with st.spinner("Tentative de connexion directe à bkam.ma…"):
+                    try:
+                        mats, rats, labels, dv = fetch_bam_direct(eval_date_auto)
+                        st.session_state.bam_curve = dict(
+                            maturities_days=mats, rates=rats, labels=labels, date=dv
+                        )
+                        st.success(
+                            f"✅ Courbe importée — **{len(rats)} points** — "
+                            f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
+                        )
+                        st.dataframe(
+                            pd.DataFrame({"Échéance": labels, "Taux (%)": [f"{r*100:.4f}%" for r in rats]}),
+                            use_container_width=True, hide_index=True
+                        )
+                    except Exception as e:
+                        st.warning(f"Import direct non disponible depuis ce serveur. Utilisez l'onglet **Import CSV BAM**.")
+
+        # ── Tab 2 : Import CSV officiel ───────────────────────────────
+        with tab_csv:
+            # Lien direct + instructions visuelles en haut
+            bam_page_url = (
+                "https://www.bkam.ma/Marches/Principaux-indicateurs/Marche-obligataire/"
+                "Marche-des-bons-de-tresor/Marche-secondaire/"
+                "Taux-de-reference-des-bons-du-tresor"
+            )
+            st.markdown(f"""
+            <div style="background:linear-gradient(90deg,#1a1a2e,#0f3460);
+                        border-radius:10px;padding:16px 20px;margin-bottom:16px;">
+                <div style="color:#fff;font-weight:700;font-size:.95rem;margin-bottom:10px;">
+                    📋 Procédure en 3 étapes
+                </div>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;">
+                    <div style="background:rgba(255,255,255,.08);border-radius:8px;
+                                padding:12px 16px;flex:1;min-width:160px;">
+                        <div style="color:#e31e24;font-weight:700;font-size:1.1rem;">① Ouvrir</div>
+                        <div style="color:#ccc;font-size:.82rem;margin-top:4px;">
+                            Cliquez sur le bouton ci-dessous pour aller sur bkam.ma
+                        </div>
+                    </div>
+                    <div style="background:rgba(255,255,255,.08);border-radius:8px;
+                                padding:12px 16px;flex:1;min-width:160px;">
+                        <div style="color:#e31e24;font-weight:700;font-size:1.1rem;">② Télécharger</div>
+                        <div style="color:#ccc;font-size:.82rem;margin-top:4px;">
+                            Choisissez la date → cliquez <b style="color:#fff">Téléchargement CSV</b>
+                        </div>
+                    </div>
+                    <div style="background:rgba(255,255,255,.08);border-radius:8px;
+                                padding:12px 16px;flex:1;min-width:160px;">
+                        <div style="color:#e31e24;font-weight:700;font-size:1.1rem;">③ Importer</div>
+                        <div style="color:#ccc;font-size:.82rem;margin-top:4px;">
+                            Glissez le fichier CSV dans la zone ci-dessous
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            col_btn, col_date = st.columns([2, 1])
+            with col_btn:
+                st.link_button(
+                    "🌐 Ouvrir bkam.ma – Taux de référence BDT",
+                    url=bam_page_url,
+                    use_container_width=True,
+                )
+            with col_date:
                 eval_date_csv = st.date_input(
                     "Date d'évaluation",
                     value=datetime.date.today(),
@@ -747,34 +749,34 @@ if "Accueil" in page:
                     key="csv_eval_date",
                 )
 
+            uploaded_csv = st.file_uploader(
+                "📂 Déposez ici le fichier CSV téléchargé depuis bkam.ma",
+                type=["csv", "txt"],
+                key="bam_csv_upload",
+                help="Fichier nommé : Taux-de-reference-des-bons-du-tresor_JJ_MM_AAAA.csv",
+            )
+
             if uploaded_csv is not None:
                 raw = uploaded_csv.read()
-                with st.expander("📄 Aperçu brut du fichier", expanded=False):
-                    try:
-                        st.code(raw.decode("utf-8-sig")[:600], language=None)
-                    except Exception:
-                        st.code(raw.decode("latin-1")[:600], language=None)
-
-                if st.button("📥 Charger cette courbe", key="btn_csv_load"):
+                if st.button("📥 Charger cette courbe", key="btn_csv_load", use_container_width=True):
                     try:
                         mats, rats, labels, dv = parse_bam_csv(raw, eval_date_csv)
                         st.session_state.bam_curve = dict(
                             maturities_days=mats, rates=rats, labels=labels, date=dv
                         )
                         st.success(
-                            f"✅ Courbe CSV chargée — **{len(rats)} points** — "
+                            f"✅ Courbe chargée — **{len(rats)} points** — "
                             f"Date valeur : **{dv.strftime('%d/%m/%Y')}**"
                         )
                         df_prev = pd.DataFrame({
-                            "Échéance / Maturité": labels,
-                            "Jours résiduels": mats,
+                            "Échéance": labels,
                             "Taux (%)": [f"{r*100:.4f}%" for r in rats],
                         })
                         st.dataframe(df_prev, use_container_width=True, hide_index=True)
                     except Exception as e:
-                        st.error(f"❌ Erreur de parsing CSV : {e}")
+                        st.error(f"❌ Erreur : {e}")
 
-        # ── Tab 3 : Saisie manuelle ───────────────────────────────────
+        # ── Tab 2 : Saisie manuelle ───────────────────────────────────
         with tab_manual:
             st.markdown("**Saisie manuelle de la courbe des taux**")
             st.caption(
